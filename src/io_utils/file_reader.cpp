@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <stdexcept>
+#include <algorithm>
 
 
 FileReader::FileReader(const std::string &filename) :

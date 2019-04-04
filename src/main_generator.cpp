@@ -1,6 +1,7 @@
 #include <libutils/timer.h>
 #include <libutils/fast_random.h>
 
+#include <string>
 #include <fstream>
 #include <iostream>
 

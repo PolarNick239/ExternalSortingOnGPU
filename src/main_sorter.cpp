@@ -62,9 +62,9 @@ int main(int argc, char* argv[])
 			FileReader reader(inputFilename);
 			std::vector<float> data(MAX_IN_MEMORY_VALUES, 0.0f);
 			#pragma omp parallel for schedule(dynamic, 1)
-			for (size_t part_index = 0; part_index < in_core_parts; ++part_index) {
-				size_t from = part_index * MAX_IN_MEMORY_VALUES;
-				size_t to = std::min(n, (part_index + 1) * MAX_IN_MEMORY_VALUES);
+			for (ptrdiff_t part_index = 0; part_index < in_core_parts; ++part_index) {
+				size_t from = (size_t) part_index * MAX_IN_MEMORY_VALUES;
+				size_t to = std::min(n, (size_t) (part_index + 1) * MAX_IN_MEMORY_VALUES);
 
 				timer reading_t;
 				{
@@ -108,7 +108,7 @@ int main(int argc, char* argv[])
 
 		timer total_t;
 		#pragma omp parallel for schedule(dynamic, 1)
-		for (size_t part_index = 0; part_index < merged_parts; ++part_index) {
+		for (ptrdiff_t part_index = 0; part_index < merged_parts; ++part_index) {
 			std::vector<std::unique_ptr<FileReader>> readers;
 			for (size_t i = 0; i < std::min((size_t) PARTS_MERGED_PER_PASS, prevpass_nparts - PARTS_MERGED_PER_PASS * part_index); ++i) {
 				size_t prevpass_part_index = PARTS_MERGED_PER_PASS * part_index + i;
