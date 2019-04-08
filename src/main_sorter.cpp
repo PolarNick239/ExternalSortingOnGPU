@@ -1,5 +1,4 @@
 #include "io_utils/file_reader.h"
-#include "defines.h"
 #include "io_utils/file_writer.h"
 
 #include <memory>
@@ -9,6 +8,17 @@
 #include <algorithm>
 #include <libutils/string_utils.h>
 #include <libutils/timer.h>
+#include <libgpu/device.h>
+#include <libgpu/context.h>
+#include <libgpu/shared_device_buffer.h>
+#include <libutils/misc.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "defines.h"
+#include "cl/merge_sort_cl.h"
 
 
 std::string getFilename(const std::string &outputFilename, size_t pass, size_t part_index)
@@ -24,16 +34,62 @@ std::string toPercent(double part, double total)
 	return to_string((int) std::floor(100.0 * part / total + 0.5));
 }
 
+#define CPU_DEVICE (-1)
+
+int chooseDevice(int argc, char *argv[], const std::vector<gpu::Device> &devices) {
+	bool shouldSpecifyDevice = false;
+	int device_index;
+	if (argc == 4) {
+		device_index = strtol(argv[3], nullptr, 10) - 1;
+		if (device_index < CPU_DEVICE || device_index >= (int) devices.size()) {
+			shouldSpecifyDevice = true;
+		}
+	} else if (devices.size() == 0) {
+		device_index = CPU_DEVICE;
+	} else if (devices.size() == 1) {
+		device_index = 0;
+	} else {
+		shouldSpecifyDevice = true;
+	}
+
+	if (shouldSpecifyDevice) {
+		std::cout << "Usage: " << argv[0] << " <inputFilename> <outputFilename> [deviceIndex]" << std::endl;
+		std::cout << "Please specify [deviceIndex] from available devices:" << std::endl;
+		std::cout << "Device #0: CPU" << std::endl;
+		for (int i = 0; i < devices.size(); ++i) {
+			ocl::DeviceInfo info;
+			info.init(devices[i].device_id_opencl);
+			std::cout << "Device #" << (i + 1) << ": " << info.device_name << std::endl;
+		}
+		return -239;
+	}
+
+	std::cout << "Using device: ";
+	if (device_index == CPU_DEVICE) {
+		std::cout << "CPU" << std::endl;
+	} else {
+		ocl::DeviceInfo info;
+		info.init(devices[device_index].device_id_opencl);
+		std::cout << info.device_name << std::endl;
+	}
+	return device_index;
+}
 
 int main(int argc, char* argv[])
 {
-	if (argc != 3) {
-		std::cout << "Usage: " << argv[0] << " <inputFilename> <outputFilename>" << std::endl;
+	if (argc != 3 && argc != 4) {
+		std::cout << "Usage: " << argv[0] << " <inputFilename> <outputFilename> [deviceIndex]" << std::endl;
 		return 1;
 	}
 
 	std::string inputFilename(argv[1]);
 	std::string outputFilename(argv[2]);
+
+	std::vector<gpu::Device> devices = gpu::enumDevices();
+	int device_index = chooseDevice(argc, argv, devices);
+	if (device_index == -239) {
+		return 1;
+	}
 
 	size_t n;
 	{
@@ -57,10 +113,33 @@ int main(int argc, char* argv[])
 		double sorting_time = 0.0;
 		double writing_time = 0.0;
 		timer total_t;
+
+#ifdef _OPENMP
+		unsigned int max_threads_number = omp_get_max_threads();
+		if (device_index != CPU_DEVICE) {
+			omp_set_num_threads(GPU_THREADS);
+		}
+#endif
+
 		#pragma omp parallel reduction(+:reading_time,sorting_time,writing_time)
 		{
 			FileReader reader(inputFilename);
+
+			gpu::gpu_mem_32f gpu_as;
+			gpu::gpu_mem_32f gpu_bs;
+			gpu::Context gpu_context;
+			const unsigned int work_group_size = 256;
+			ocl::Kernel merge(merge_sort_kernel, merge_sort_kernel_length, "merge", "-DWORKGROUP_SIZE=" + to_string(work_group_size));
+			if (device_index != CPU_DEVICE) {
+				gpu_context.init(devices[device_index].device_id_opencl);
+				gpu_context.activate();
+				gpu_as.resizeN(MAX_IN_MEMORY_VALUES);
+				gpu_bs.resizeN(MAX_IN_MEMORY_VALUES);
+				merge.compile();
+			}
+
 			std::vector<float> data(MAX_IN_MEMORY_VALUES, 0.0f);
+
 			#pragma omp parallel for schedule(dynamic, 1)
 			for (ptrdiff_t part_index = 0; part_index < in_core_parts; ++part_index) {
 				size_t from = (size_t) part_index * MAX_IN_MEMORY_VALUES;
@@ -76,8 +155,21 @@ int main(int argc, char* argv[])
 				reading_time += reading_t.elapsed();
 
 				timer sorting_t;
-				// TODO: implement sort on GPU
-				std::sort(data.begin(), data.begin() + (to - from));
+				const unsigned int ndata = (to - from);
+				if (device_index == CPU_DEVICE) {
+					std::sort(data.begin(), data.begin() + ndata);
+				} else {
+					gpu_as.writeN(data.data(), ndata);
+
+					unsigned int global_work_size = (ndata + work_group_size - 1) / work_group_size * work_group_size;
+					for (unsigned int sortedChunksSize = 1; sortedChunksSize < ndata; sortedChunksSize *= 2) {
+						merge.exec(gpu::WorkSize(work_group_size, global_work_size),
+								   gpu_as, gpu_bs, ndata, sortedChunksSize);
+						gpu_as.swap(gpu_bs);
+					}
+
+					gpu_as.readN(data.data(), ndata);
+				}
 				sorting_time += sorting_t.elapsed();
 
 				timer writing_t;
@@ -90,6 +182,13 @@ int main(int argc, char* argv[])
 				writing_time += writing_t.elapsed();
 			}
 		}
+
+#ifdef _OPENMP
+		if (device_index != CPU_DEVICE) {
+			omp_set_num_threads(max_threads_number);
+		}
+#endif
+
 		double sum_time = reading_time + sorting_time + writing_time;
 		size_t total_values = 2 * n;
 		std::cout << "    IO: " << (total_values / total_t.elapsed() / 1024 / 1024 * sizeof(float)) << " MB/s" << std::endl;

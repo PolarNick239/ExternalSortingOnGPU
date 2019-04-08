@@ -16,7 +16,7 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	long int n = strtol(argv[1], nullptr, 10);
+	long long n = strtoll(argv[1], nullptr, 10);
 	if (n <= 0) {
 		std::cout << "Number of values to generate should be positive integer value, but " << argv[1] << " found!" << std::endl;
 		return 1;
